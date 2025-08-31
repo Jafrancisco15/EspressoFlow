@@ -2,7 +2,11 @@ import React, { useEffect, useRef, useState } from 'react'
 
 // ---- OpenCV runtime wait ---- const waitForOpenCV = () => new Promise(resolve => { const ready = () => (window.cv && window.cv.Mat) const check = () => { if (ready()) return resolve() if (window.cv && typeof window.cv['onRuntimeInitialized'] === 'function') { const cb = window.cv['onRuntimeInitialized'] window.cv['onRuntimeInitialized'] = () => { try{cb()}catch(e){} resolve() } return } setTimeout(check, 100) } check() })
 
-// ---- video helpers ---- const waitEvent = (el, ev) => new Promise(res => { const h = () => { el.removeEventListener(ev, h); res() } el.addEventListener(ev, h, { once:true }) }) const ensureReady = async (video) => { if (Number.isNaN(video.duration) || !isFinite(video.duration) || video.duration === 0) { await waitEvent(video, 'loadedmetadata') } if (video.readyState < 2) { // HAVE_CURRENT_DATA await waitEvent(video, 'loadeddata') } } const seekTo = async (video, t) => { if (!isFinite(video.duration) || video.duration === 0) return if (t > video.duration) t = video.duration if (t < 0) t = 0 video.currentTime = t try { await waitEvent(video, 'seeked') } catch(e){} }
+// ---- video helpers ---- const waitEvent = (el, ev) => new Promise(res => { const h = () => { el.removeEventListener(ev, h); res() } el.addEventListener(ev, h, { once:true }) });
+
+const ensureReady = async (video) => { if (Number.isNaN(video.duration) || !isFinite(video.duration) || video.duration === 0) { await waitEvent(video, 'loadedmetadata'); } if (video.readyState < 2) { // HAVE_CURRENT_DATA await waitEvent(video, 'loadeddata'); } };
+
+const seekTo = async (video, t) => { if (!isFinite(video.duration) || video.duration === 0) { return; } if (t > video.duration) t = video.duration; if (t < 0) t = 0; video.currentTime = t; try { await waitEvent(video, 'seeked'); } catch(e){} };
 
 function App() { const videoRef = useRef(null) const canvasRef = useRef(null) const chartRef = useRef(null)
 
