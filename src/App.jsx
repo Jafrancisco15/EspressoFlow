@@ -8,7 +8,7 @@ const ensureReady = async (video) => { if (Number.isNaN(video.duration) || !isFi
 
 const seekTo = async (video, t) => { if (!isFinite(video.duration) || video.duration === 0) return; if (t > video.duration) t = video.duration; if (t < 0) t = 0; video.currentTime = t; try { await waitEvent(video, 'seeked'); } catch (e) {} };
 
-function App() { const videoRef = useRef(null); const canvasRef = useRef(null); const chartRef = useRef(null);
+function App() { const videoRef = useRef(null); const canvasRef = useRef(null); const chartRef = useRef(null); const uploadRef = useRef(null); const cameraRef = useRef(null);
 
 const [videoURL, setVideoURL] = useState(null); const [frameLoaded, setFrameLoaded] = useState(false); const [status, setStatus] = useState('Cargando OpenCV...'); const [cvReady, setCvReady] = useState(false);
 
@@ -227,7 +227,12 @@ return ( <div className="container"> <div className="row" style={{ alignItems: '
 
   <div className="card" style={{ marginBottom: 16 }}>
     <h3>1) Sube video</h3>
-    <input type="file" accept="video/*" capture="environment" onChange={onVideoFile} />
+    <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+      <button className="btn" onClick={() => uploadRef.current?.click()}>Elegir desde galería/archivos</button>
+      <button className="btn secondary" onClick={() => cameraRef.current?.click()}>Grabar con cámara</button>
+      <input ref={uploadRef} type="file" accept="video/*" onChange={onVideoFile} style={{ display: 'none' }} />
+      <input ref={cameraRef} type="file" accept="video/*" capture="environment" onChange={onVideoFile} style={{ display: 'none' }} />
+    </div>
     {videoURL && (
       <video
         ref={videoRef}
