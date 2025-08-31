@@ -55,6 +55,16 @@ function App() {
   const [metrics, setMetrics] = useState(null)
   const [recs, setRecs] = useState([])
 
+  // Inputs opcionales para EY / sensorial
+  const [dose, setDose] = useState('')
+  const [output, setOutput] = useState('')
+  const [tds, setTds] = useState('')
+  const [balance, setBalance] = useState(5) // 1..10
+  const [notes, setNotes] = useState('')
+
+  // Historial (localStorage)
+  const [history, setHistory] = useState([])
+
   const drawState = useRef({dragging:false,start:null})
 
   useEffect(() => {
@@ -63,6 +73,14 @@ function App() {
       setCvReady(true)
       setStatus("OpenCV listo. Sube tu video y toma un cuadro (opcional ROI), o analiza todo el frame.")
     })().catch(err => setStatus("Error cargando OpenCV: " + err?.message))
+  }, [])
+
+  useEffect(() => {
+    // cargar historial de localStorage
+    try {
+      const raw = localStorage.getItem('espressoHistory')
+      if (raw) setHistory(JSON.parse(raw))
+    } catch {}
   }, [])
 
   const onVideoFile = async (e) => {
@@ -228,7 +246,7 @@ function App() {
     const spikeRate = perFrame.length>0 ? (spikesIdx.length/perFrame.length) : 0
     const areaJumpRate = perFrame.length>0 ? (areaJumpIdx.length/perFrame.length) : 0
 
-    // Score 0..100 suave: mapea CV 0..1 → 0..50; spikeRate 0..0.3 → 0..35; areaJumpRate 0..0.2 → 0..15
+    // Score 0..100 suave: mapea CV 0..1 → 0..50; spikeRate 0..0.30 → 0..35; areaJumpRate 0..0.20 → 0..15
     const sCV = clamp(mapRange(cvJets, 0, 1.0, 0, 50), 0, 50)
     const sSp = clamp(mapRange(spikeRate, 0, 0.30, 0, 35), 0, 35)
     const sAJ = clamp(mapRange(areaJumpRate, 0, 0.20, 0, 15), 0, 15)
@@ -278,6 +296,56 @@ function App() {
     })
   }
 
+  // ------- EY & guardar experimento -------
+  const EY = computeEY(dose, output, tds) // en %, o null si incompleto
+
+  const saveExperiment = () => {
+    if (!metrics) return
+    const exp = {
+      id: Date.now(),
+      timestamp: new Date().toISOString(),
+      dose: parseFloatOrNull(dose),
+      output: parseFloatOrNull(output),
+      tds: parseFloatOrNull(tds),
+      ey: EY !== null ? round2(EY) : null,
+      balance: Number(balance) || null,
+      notes: (notes || '').trim() || null,
+      // resumen de métricas
+      score: metrics.score,
+      jets_mean: round2(metrics.jets_mean),
+      jets_cv: round2(metrics.jets_cv),
+      spikeRate: round2(metrics.spikeRate*100), // %
+      areaJumpRate: round2(metrics.areaJumpRate*100), // %
+      duration: round2(metrics.duration),
+      frames: metrics.frames
+    }
+    const next = [exp, ...history]
+    setHistory(next)
+    try { localStorage.setItem('espressoHistory', JSON.stringify(next)) } catch {}
+  }
+
+  const deleteExperiment = (id) => {
+    const next = history.filter(x => x.id !== id)
+    setHistory(next)
+    try { localStorage.setItem('espressoHistory', JSON.stringify(next)) } catch {}
+  }
+  const clearHistory = () => {
+    setHistory([])
+    try { localStorage.removeItem('espressoHistory') } catch {}
+  }
+  const exportHistoryCSV = () => {
+    const header = "timestamp,dose_g,output_g,tds_pct,ey_pct,balance,notes,score,jets_mean,jets_cv,spike_rate_pct,area_jump_rate_pct,duration_s,frames\n"
+    const rows = history.map(h => [
+      h.timestamp, val(h.dose), val(h.output), val(h.tds), val(h.ey), val(h.balance), csvSafe(h.notes),
+      h.score, h.jets_mean, h.jets_cv, h.spikeRate, h.areaJumpRate, h.duration, h.frames
+    ].join(",")).join("\n")
+    const blob = new Blob([header + rows], {type:'text/csv'})
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a'); a.href=url; a.download='espresso_history.csv'; document.body.appendChild(a); a.click(); a.remove()
+    URL.revokeObjectURL(url)
+  }
+
+  // ------- CSV de métricas del tiro actual -------
   const exportCSV = () => {
     if (!metrics) return
     const header = "t_sec,jets,area,spike,areaJump\n"
@@ -348,7 +416,7 @@ function App() {
         <h3>3) Analizar</h3>
         <div className="row">
           <button className="btn" disabled={processing || !videoURL} onClick={runAnalysis}>Iniciar análisis</button>
-          <button className="btn secondary" disabled={!metrics} onClick={exportCSV}>Exportar CSV</button>
+          <button className="btn secondary" disabled={!metrics} onClick={exportCSV}>Exportar CSV (tiro)</button>
         </div>
         {processing && <p className="small warn">Procesando en tu navegador… Mantén esta pestaña activa.</p>}
         {metrics && (
@@ -367,20 +435,110 @@ function App() {
               <canvas ref={chartRef} width={900} height={200} style={{width:'100%', border:'1px solid #232339', borderRadius:'8px', cursor:'pointer'}} title="Haz clic para saltar a ese tiempo" />
               <p className="small muted">Clic en el gráfico para saltar al frame correspondiente y ver el overlay en el canvas superior.</p>
             </div>
-            {recs?.length>0 && (
-              <div style={{marginTop:12}}>
-                <h4>Recomendaciones</h4>
-                <ul>
-                  {recs.map((r,i)=>(<li key={i} className="small">{r}</li>))}
-                </ul>
+
+            {/* 4) Formulario opcional + Guardar en historial */}
+            <div className="card" style={{marginTop:16}}>
+              <h3>4) Datos opcionales y guardar experimento</h3>
+              <div className="row" style={{gap:12}}>
+                <div>
+                  <label className="small muted">Dosis (g)</label>
+                  <input className="pill" style={{display:'block', padding:'8px'}} type="number" min="0" step="0.1" value={dose} onChange={e=>setDose(e.target.value)} />
+                </div>
+                <div>
+                  <label className="small muted">Salida (g/ml)</label>
+                  <input className="pill" style={{display:'block', padding:'8px'}} type="number" min="0" step="0.1" value={output} onChange={e=>setOutput(e.target.value)} />
+                </div>
+                <div>
+                  <label className="small muted">TDS (%)</label>
+                  <input className="pill" style={{display:'block', padding:'8px'}} type="number" min="0" step="0.01" value={tds} onChange={e=>setTds(e.target.value)} />
+                </div>
+                <div>
+                  <label className="small muted">EY (%)</label>
+                  <div className="pill" style={{padding:'8px'}}>{EY!==null ? EY.toFixed(2) : '—'}</div>
+                </div>
+                <div>
+                  <label className="small muted">Balance sensorial (1–10)</label>
+                  <input className="pill" style={{display:'block', padding:'8px'}} type="range" min="1" max="10" value={balance} onChange={e=>setBalance(e.target.value)} />
+                  <div className="small muted" style={{marginTop:4}}>Valor: {balance}</div>
+                </div>
               </div>
-            )}
+              <div style={{marginTop:8}}>
+                <label className="small muted">Notas</label>
+                <textarea className="pill" style={{width:'100%', minHeight:70, padding:'8px'}} value={notes} onChange={e=>setNotes(e.target.value)} placeholder="Aroma, dulzor, acidez, textura, aftertaste, etc."/>
+              </div>
+              <div className="row" style={{marginTop:12}}>
+                <button className="btn" onClick={saveExperiment}>Guardar experimento en historial</button>
+              </div>
+              {recs?.length>0 && (
+                <div style={{marginTop:12}}>
+                  <h4>Recomendaciones</h4>
+                  <ul>
+                    {recs.map((r,i)=>(<li key={i} className="small">{r}</li>))}
+                  </ul>
+                </div>
+              )}
+            </div>
           </>
+        )}
+      </div>
+
+      {/* Historial */}
+      <div className="card" style={{marginBottom:16}}>
+        <h3>Historial</h3>
+        <div className="row" style={{gap:8, marginBottom:8}}>
+          <button className="btn secondary" onClick={exportHistoryCSV} disabled={!history.length}>Exportar CSV (historial)</button>
+          <button className="btn secondary" onClick={clearHistory} disabled={!history.length}>Borrar todo</button>
+        </div>
+        {!history.length ? (
+          <p className="small muted">Aún no has guardado experimentos. Tras analizar, completa (opcional) los datos y pulsa “Guardar experimento”.</p>
+        ) : (
+          <div style={{overflowX:'auto'}}>
+            <table style={{width:'100%', borderCollapse:'collapse'}}>
+              <thead>
+                <tr className="small">
+                  <th style={th}>Fecha/Hora</th>
+                  <th style={th}>Dosis (g)</th>
+                  <th style={th}>Salida</th>
+                  <th style={th}>TDS (%)</th>
+                  <th style={th}>EY (%)</th>
+                  <th style={th}>Score</th>
+                  <th style={th}>Jets μ</th>
+                  <th style={th}>Jets CV</th>
+                  <th style={th}>Spike %</th>
+                  <th style={th}>AreaJump %</th>
+                  <th style={th}>Notas</th>
+                  <th style={th}></th>
+                </tr>
+              </thead>
+              <tbody>
+                {history.map(h=>(
+                  <tr key={h.id} className="small" style={{borderTop:'1px solid #232339'}}>
+                    <td style={td}>{fmtDate(h.timestamp)}</td>
+                    <td style={td}>{val(h.dose)}</td>
+                    <td style={td}>{val(h.output)}</td>
+                    <td style={td}>{val(h.tds)}</td>
+                    <td style={td}>{val(h.ey)}</td>
+                    <td style={td}>{h.score}</td>
+                    <td style={td}>{h.jets_mean}</td>
+                    <td style={td}>{h.jets_cv}</td>
+                    <td style={td}>{h.spikeRate}</td>
+                    <td style={td}>{h.areaJumpRate}</td>
+                    <td style={{...td, maxWidth:240, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap'}} title={h.notes||''}>{h.notes||'—'}</td>
+                    <td style={td}><button className="btn secondary" onClick={()=>deleteExperiment(h.id)}>Borrar</button></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
       </div>
     </div>
   )
 }
+
+// ---------- table cell styles ----------
+const th = { textAlign:'left', padding:'8px 6px', borderBottom:'1px solid #232339', color:'#9aa0b3' }
+const td = { padding:'8px 6px' }
 
 // ---------- Utils ----------
 function normRect({x1,y1,x2,y2}){ const x=Math.min(x1,x2), y=Math.min(y1,y2); return {x,y,w:Math.abs(x2-x1),h:Math.abs(y2-y1)} }
@@ -428,6 +586,17 @@ function mapRange(x, inMin, inMax, outMin, outMax){
   if (inMax===inMin) return outMin
   const t = (x-inMin)/(inMax-inMin)
   return outMin + clamp(t,0,1)*(outMax-outMin)
+}
+function parseFloatOrNull(v){ const n = parseFloat(v); return Number.isFinite(n) ? n : null }
+function round2(x){ return Math.round((x + Number.EPSILON)*100)/100 }
+function fmtDate(iso){ try{ return new Date(iso).toLocaleString() } catch{ return iso } }
+function val(v){ return (v===null || v===undefined || v==='') ? '—' : v }
+function csvSafe(s){ if (!s) return ''; const q = String(s).replace(/"/g,'""'); return `"${q}"` }
+function computeEY(dose, output, tds){
+  const d = parseFloat(dose), o = parseFloat(output), t = parseFloat(tds)
+  if (!Number.isFinite(d) || d<=0 || !Number.isFinite(o) || o<0 || !Number.isFinite(t) || t<0) return null
+  // EY% = (TDS% * beverage_mass) / dose
+  return (t * o) / d
 }
 
 // ---- Chart drawing & interaction ----
