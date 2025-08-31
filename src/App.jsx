@@ -250,7 +250,7 @@ function App() {
     // Hacer clickable el chart para saltar en el video
     attachChartClick(chartRef.current, perFrame, async (t)=>{
       await seekTo(videoRef.current, t)
-      // Renderiza el frame clicado en el canvas con overlay básico
+      // Render frame seleccionado con overlay
       const out = canvasRef.current
       const W2 = Math.round(videoRef.current.videoWidth * scale)
       const H2 = Math.round(videoRef.current.videoHeight * scale)
@@ -524,4 +524,5 @@ function generateRecommendations(m){
   if (recs.length===0) recs.push("Flujo estable: conserva receta y técnica; puedes buscar mejoras finas en dulzor ajustando temperatura o ratio.")
   return recs
 }
+
 export default App
