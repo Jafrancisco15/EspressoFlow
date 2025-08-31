@@ -1,3 +1,4 @@
+
 import React, { useEffect, useRef, useState } from 'react'
 
 // ---- OpenCV runtime wait ----
@@ -51,25 +52,30 @@ function App() {
   const [roi, setRoi] = useState(null)
   const [scale, setScale] = useState(0.6)
 
+  // Procesamiento / resultados
   const [processing, setProcessing] = useState(false)
   const [metrics, setMetrics] = useState(null)
   const [recs, setRecs] = useState([])
 
-  // —— NUEVO: inputs PRE-ANÁLISIS para estimar flujo ——
+  // —— Inputs PRE-ANÁLISIS
   const [useFlowEst, setUseFlowEst] = useState(true)
   const [dose, setDose] = useState('')
   const [output, setOutput] = useState('')          // bebida final (g)
   const [tds, setTds] = useState('')
   const [balance, setBalance] = useState(5)         // 1..10
   const [notes, setNotes] = useState('')
-  const [tStart, setTStart] = useState('')          // s (opcional)
-  const [tEnd, setTEnd] = useState('')              // s (opcional)
+
+  // —— Sliders de calibración
+  const [spikeDelta, setSpikeDelta] = useState(2)
+  const [spikeMinJets, setSpikeMinJets] = useState(3)
+  const [minBlobArea, setMinBlobArea] = useState(35)
+  const [areaJumpFactor, setAreaJumpFactor] = useState(1.35)
 
   // Historial (localStorage)
   const [history, setHistory] = useState([])
 
   // Panel de inspección al hacer click en el gráfico
-  const [inspect, setInspect] = useState(null) // {t, jets, flows[], gini, maxShare}
+  const [inspect, setInspect] = useState(null) // {tAbs, tRel, jets, flows[], gini, maxShare}
 
   const drawState = useRef({dragging:false,start:null})
 
@@ -77,12 +83,12 @@ function App() {
     (async () => {
       await waitForOpenCV()
       setCvReady(true)
-      setStatus("OpenCV listo. Sube tu video, define inputs (si deseas flujo) y analiza.")
+      setStatus("OpenCV listo. Sube tu video, calibra si quieres y analiza.")
     })().catch(err => setStatus("Error cargando OpenCV: " + err?.message))
   }, [])
 
   useEffect(() => {
-    // cargar historial de localStorage
+    // cargar historial
     try {
       const raw = localStorage.getItem('espressoHistory')
       if (raw) setHistory(JSON.parse(raw))
@@ -176,26 +182,8 @@ function App() {
   // ------- EY (para historial) -------
   const EY = computeEY(dose, output, tds) // en %, o null si incompleto
 
-  // ------- Validación de inputs previos -------
-  const flowInputsOK = () => {
-    if (!useFlowEst) return true
-    const out = parseFloat(output)
-    if (!Number.isFinite(out) || out <= 0) return false
-    // tStart/tEnd son opcionales; si ambos están, deben ser válidos
-    const ts = parseFloat(tStart)
-    const te = parseFloat(tEnd)
-    if (Number.isFinite(ts) && Number.isFinite(te)) {
-      if (te <= ts) return false
-    }
-    return true
-  }
-
   const runAnalysis = async () => {
     if (!cvReady) return
-    if (!flowInputsOK()) {
-      setStatus("Completa los inputs: bebida final (>0 g) y/o revisa la ventana de tiempo.")
-      return
-    }
     const cv = window.cv
     const video = videoRef.current
     if (!video) { setStatus("Sube un video primero."); return }
@@ -205,30 +193,17 @@ function App() {
     setInspect(null)
     setStatus("Analizando video…")
 
-    // Ventana de análisis
-    let startSec = 0
-    let endSec = video.duration
-    const ts = parseFloat(tStart), te = parseFloat(tEnd)
-    if (Number.isFinite(ts)) startSec = clamp(ts, 0, video.duration)
-    if (Number.isFinite(te)) endSec = clamp(te, 0, video.duration)
-    if (endSec <= startSec) { startSec = 0; endSec = video.duration } // fallback
-
-    const extractionDuration = Math.max(0.1, endSec - startSec)
-    const avgFlow_gps = (useFlowEst && parseFloat(output)>0)
-      ? (parseFloat(output) / extractionDuration)
-      : null
-
     const W = Math.round(video.videoWidth * scale)
     const H = Math.round(video.videoHeight * scale)
     const tmp = document.createElement('canvas'); tmp.width=W; tmp.height=H
     const ctx = tmp.getContext('2d')
 
     const r = roi ? roiRectScaled(roi, scale) : {x:0,y:0,w:W,h:H}
-    const perFrame = []
+    const perFrameFull = [] // serie completa en todo el video (t abs)
     let lastArea = null
 
     const FPS = 10
-    for (let t=startSec; t<=endSec; t+=1.0/FPS) {
+    for (let t=0; t<=video.duration; t+=1.0/FPS) {
       await seekTo(video, t)
       ctx.drawImage(video, 0, 0, W, H)
       const frame = cv.imread(tmp)
@@ -245,63 +220,105 @@ function App() {
       cv.morphologyEx(m, m, cv.MORPH_OPEN, kernel)
 
       // Áreas por componente (chorro)
-      const areas = componentAreasCC(m, 35) // píxeles
+      const areas = componentAreasCC(m, minBlobArea)
       const jets = areas.length
       const area = areas.reduce((a,b)=>a+b,0)
 
-      // Spike: salto >=2 jets respecto al frame anterior y nivel mínimo >= 3
-      let spike = 0
-      if (perFrame.length>0) {
-        const prev = perFrame[perFrame.length-1].jets
-        if (jets >= 3 && (jets - prev) >= 2) spike = 1
-      }
-
-      // area jump relativo
-      let areaJump = 0
-      if (lastArea!==null && area>lastArea*1.35) areaJump = 1
+      // area jump relativo preliminar (para overlay/progreso)
+      let areaJumpFlag = 0
+      if (lastArea!==null && area>lastArea*areaJumpFactor) areaJumpFlag = 1
       lastArea = area
 
-      // Estimación de flujo por chorro (g/s) proporcional al área
-      let flowPerJet = null, gini = null, maxShare = null
-      if (avgFlow_gps !== null && area > 0) {
-        const shares = areas.map(a => a/area)
-        flowPerJet = shares.map(s => s*avgFlow_gps)
-        gini = giniCoefficient(flowPerJet)
-        maxShare = Math.max(...shares)
-      }
-
-      perFrame.push({ t: t - startSec, jets, area, spike, areaJump, gini, maxShare })
+      perFrameFull.push({ t, jets, area, areas, areaJumpFlag })
 
       // Overlay preview (cada 3 frames)
-      if ((perFrame.length % 3) === 0) {
+      if ((perFrameFull.length % 3) === 0) {
         const out = canvasRef.current
         out.width = W; out.height = H
         const octx = out.getContext('2d')
         octx.drawImage(tmp, 0, 0)
         if (roi) drawRect(octx, r, '#60a5fa')
         drawMaskContours(octx, m, r.x, r.y, '#60a5fa')
-        const pct = Math.round(100*((t-startSec)/(endSec-startSec)))
-        setStatus(`Procesando… ${isFinite(pct)?pct:0}%`)
+        setStatus(`Procesando… ${Math.round(100*t/video.duration)}%`)
       }
 
       frame.delete(); A.delete(); g.delete(); m.delete(); kernel.delete()
     }
 
-    // Métricas (suaves)
-    const jetsSeries = perFrame.map(p=>p.jets)
-    const areaSeries = perFrame.map(p=>p.area)
-    const spikesIdx = perFrame.map((p,i)=> p.spike? i : -1).filter(i=>i>=0)
-    const areaJumpIdx = perFrame.map((p,i)=> p.areaJump? i : -1).filter(i=>i>=0)
+    // --- Detectar ventana de flujo automático por umbral relativo de área
+    const areasAll = perFrameFull.map(p=>p.area)
+    const maxA = Math.max(1, ...areasAll)
+    const thr = 0.12 * maxA // 12% del máximo
+    const K = 3 // frames consecutivos
+    let startIdx = 0, endIdx = perFrameFull.length - 1
+    for (let i=0; i<perFrameFull.length-K; i++){
+      let ok = true
+      for (let k=0;k<K;k++){ if (perFrameFull[i+k].area < thr) { ok=false; break } }
+      if (ok){ startIdx = i; break }
+    }
+    for (let i=perFrameFull.length-1; i>=K; i--){
+      let ok = true
+      for (let k=0;k<K;k++){ if (perFrameFull[i-k].area < thr) { ok=false; break } }
+      if (ok){ endIdx = i; break }
+    }
+    if (endIdx < startIdx) { startIdx = 0; endIdx = perFrameFull.length - 1 }
 
+    const startSec = perFrameFull[startIdx]?.t ?? 0
+    const endSec = perFrameFull[endIdx]?.t ?? video.duration
+    const extractionDuration = Math.max(0.1, endSec - startSec)
+
+    // --- Estimar flujo medio si el usuario dio peso (g)
+    const avgFlow_gps = (useFlowEst && parseFloat(output)>0)
+      ? (parseFloat(output) / extractionDuration)
+      : null
+
+    // --- Construir serie "activa" (t relativo desde inicio de flujo)
+    const series = perFrameFull.slice(startIdx, endIdx+1).map((p, idx) => ({
+      t: p.t - startSec,
+      jets: p.jets,
+      area: p.area,
+      areas: p.areas // para inspección y gini
+    }))
+
+    // --- Spikes y areaJumps con sliders
+    const spikesIdx = []
+    const areaJumpIdx = []
+    for (let i=0;i<series.length;i++){
+      if (i>0){
+        if (series[i].jets >= spikeMinJets && (series[i].jets - series[i-1].jets) >= spikeDelta){
+          spikesIdx.push(i)
+        }
+        if (series[i-1].area>0 && series[i].area > series[i-1].area * areaJumpFactor){
+          areaJumpIdx.push(i)
+        }
+      }
+    }
+
+    // Métricas (suaves)
+    const jetsSeries = series.map(p=>p.jets)
+    const areaSeries = series.map(p=>p.area)
     const mean = meanArr(jetsSeries)
     const sd = stdArr(jetsSeries, mean)
-    const cvJets = mean>0 ? sd/mean : 0 // coeficiente de variación
-    const spikeRate = perFrame.length>0 ? (spikesIdx.length/perFrame.length) : 0
-    const areaJumpRate = perFrame.length>0 ? (areaJumpIdx.length/perFrame.length) : 0
+    const cvJets = mean>0 ? sd/mean : 0
+    const spikeRate = series.length>0 ? (spikesIdx.length/series.length) : 0
+    const areaJumpRate = series.length>0 ? (areaJumpIdx.length/series.length) : 0
 
     // Gini y cuota máxima (medianas) si hubo estimación de flujo
-    const giniMed = median(perFrame.map(p => p.gini).filter(x=>x!==null))
-    const maxShareMed = median(perFrame.map(p => p.maxShare).filter(x=>x!==null))
+    let giniMed = null, maxShareMed = null
+    if (avgFlow_gps!=null){
+      const ginis = [], sharesMax = []
+      for (const fr of series){
+        const A = fr.areas.reduce((a,b)=>a+b,0)
+        if (A>0){
+          const shares = fr.areas.map(a => a/A)
+          const flows = shares.map(s => s*avgFlow_gps)
+          ginis.push(giniCoefficient(flows))
+          sharesMax.push(Math.max(...shares))
+        }
+      }
+      giniMed = median(ginis)
+      maxShareMed = median(sharesMax)
+    }
 
     // Score 0..100 suave
     const sCV = clamp(mapRange(cvJets, 0, 1.0, 0, 50), 0, 50)
@@ -310,50 +327,50 @@ function App() {
     const score = Math.round(sCV + sSp + sAJ)
 
     const mtr = { 
-      frames: perFrame.length, duration: (endSec - startSec),
+      frames: series.length, duration: extractionDuration,
       jets_mean: mean, jets_sd: sd, jets_cv: cvJets, 
       spikes: spikesIdx.length, areaJumps: areaJumpIdx.length, 
       spikeRate, areaJumpRate, score, 
-      series: perFrame, spikesIdx, areaJumpIdx,
-      avgFlow_gps: avgFlow_gps, giniMed: giniMed, maxShareMed: maxShareMed
+      series, spikesIdx, areaJumpIdx,
+      avgFlow_gps, giniMed, maxShareMed,
+      startSec, endSec
     }
     setMetrics(mtr)
     setStatus("Listo ✅. Revisa indicadores, guarda y exporta.")
-    drawChart(chartRef.current, perFrame, spikesIdx, areaSeries)
     setRecs(generateRecommendations(mtr))
     setProcessing(false)
-
-    // click en chart → saltar y calcular detalle de flujos en ese frame
-    attachChartClick(chartRef.current, perFrame, async (tRel)=>{
-      const tAbs = startSec + tRel
-      await seekTo(videoRef.current, tAbs)
-      const detail = await computeFlowDetailAt(videoRef.current, roi, scale, avgFlow_gps)
-      setInspect(detail) // {t, jets, flows[], gini, maxShare}
-      // y pinto overlay de ese frame
-      const out = canvasRef.current
-      const W2 = Math.round(videoRef.current.videoWidth * scale)
-      const H2 = Math.round(videoRef.current.videoHeight * scale)
-      const tmp2 = document.createElement('canvas'); tmp2.width=W2; tmp2.height=H2
-      const ctx2 = tmp2.getContext('2d')
-      ctx2.drawImage(videoRef.current, 0, 0, W2, H2)
-      const cv = window.cv
-      const frame = cv.imread(tmp2)
-      const r2 = roi ? roiRectScaled(roi, scale) : {x:0,y:0,w:W2,h:H2}
-      let A2 = frame.roi(new cv.Rect(r2.x, r2.y, r2.w, r2.h))
-      let g2 = new cv.Mat(); cv.cvtColor(A2, g2, cv.COLOR_RGBA2GRAY)
-      cv.GaussianBlur(g2, g2, new cv.Size(3,3), 0)
-      let m2 = new cv.Mat()
-      cv.adaptiveThreshold(g2, m2, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 21, 5)
-      let kernel2 = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(3,3))
-      cv.morphologyEx(m2, m2, cv.MORPH_OPEN, kernel2)
-      out.width = W2; out.height = H2
-      const octx = out.getContext('2d')
-      octx.drawImage(tmp2, 0, 0)
-      if (roi) drawRect(octx, r2, '#60a5fa')
-      drawMaskContours(octx, m2, r2.x, r2.y, '#60a5fa')
-      frame.delete(); A2.delete(); g2.delete(); m2.delete(); kernel2.delete()
-    })
   }
+
+  // ---- DIBUJO DEL GRÁFICO (fix: ahora en effect para el primer análisis)
+  useEffect(()=>{
+    if (!metrics) return
+    const areaSeries = metrics.series.map(p=>p.area)
+    drawChart(chartRef.current, metrics.series, metrics.spikesIdx, areaSeries)
+    // click handler para saltar y mostrar detalle
+    attachChartClick(chartRef.current, metrics.series, async (tRel)=>{
+      const tAbs = metrics.startSec + tRel
+      await seekTo(videoRef.current, tAbs)
+      const detail = await computeFlowDetailAt(videoRef.current, roi, scale, metrics.avgFlow_gps)
+      // si podemos reutilizar las áreas ya calculadas en ese índice, mejor
+      const idx = findNearestIndex(metrics.series, tRel)
+      if (idx>=0){
+        const fr = metrics.series[idx]
+        if (metrics.avgFlow_gps!=null && fr.areas?.length){
+          const sumA = fr.areas.reduce((a,b)=>a+b,0)
+          const flows = sumA>0 ? fr.areas.map(a=>a/sumA*metrics.avgFlow_gps) : null
+          const gini = flows? giniCoefficient(flows): null
+          const maxShare = sumA>0 ? Math.max(...fr.areas.map(a=>a/sumA)) : null
+          setInspect({ tAbs, tRel, jets: fr.jets, flows, gini, maxShare })
+        } else {
+          setInspect({ tAbs, tRel, jets: detail.jets, flows: detail.flows, gini: detail.gini, maxShare: detail.maxShare })
+        }
+      } else {
+        setInspect(detail)
+      }
+      // Overlay del frame seleccionado
+      renderOverlayAtCurrent(videoRef.current, roi, scale)
+    })
+  }, [metrics])
 
   // ------- Guardar experimento (historial) -------
   const saveExperiment = () => {
@@ -409,10 +426,11 @@ function App() {
   // ------- CSV de métricas del tiro actual -------
   const exportShotCSV = () => {
     if (!metrics) return
-    const header = "t_sec,jets,area,spike,areaJump,gini,maxShare\n"
-    const rows = metrics.series.map(p=>[
-      p.t.toFixed(3), p.jets, p.area, p.spike, p.areaJump,
-      p.gini!=null? round3(p.gini):'', p.maxShare!=null? round3(p.maxShare):''
+    const header = "t_sec,jets,area,spike,areaJump\n"
+    const rows = metrics.series.map((p,i)=>[
+      p.t.toFixed(3), p.jets, p.area,
+      metrics.spikesIdx.includes(i)?1:0,
+      metrics.areaJumpIdx.includes(i)?1:0
     ].join(",")).join("\n")
     const blob = new Blob([header+rows], {type:'text/csv'})
     const url = URL.createObjectURL(blob)
@@ -422,7 +440,8 @@ function App() {
     URL.revokeObjectURL(url)
   }
 
-  const canAnalyze = !!videoURL && (!useFlowEst || flowInputsOK())
+  // No bloqueamos análisis si falta el peso; simplemente no habrá métricas de flujo
+  const canAnalyze = !!videoURL
 
   return (
     <div className="container">
@@ -448,35 +467,60 @@ function App() {
             controls
             playsInline
             crossOrigin="anonymous"
-            onLoadedMetadata={()=>setStatus("Video cargado. Define inputs debajo y/o 'Tomar cuadro' para dibujar ROI.")}
+            onLoadedMetadata={()=>setStatus("Video cargado. Puedes definir ROI, calibrar y analizar.")}
           />
         )}
       </div>
 
-      {/* 2) Pre-análisis: inputs para estimar flujo */}
+      {/* 2) Pre-análisis: estimación de flujo y calibración */}
       <div className="card" style={{marginBottom:16}}>
-        <h3>2) Pre-análisis (opcional): estimar flujo</h3>
+        <h3>2) Pre-análisis (opcional)</h3>
         <label className="small" style={{display:'flex', alignItems:'center', gap:8}}>
           <input type="checkbox" checked={useFlowEst} onChange={e=>setUseFlowEst(e.target.checked)} />
-          Usar estimación de flujo (g/s) a partir de bebida final y ventana de extracción
+          Estimar flujo (g/s) a partir de bebida final (el tiempo lo detecta el video automáticamente)
         </label>
         <div className="row" style={{gap:12, marginTop:8}}>
           <div>
-            <label className="small muted">Bebida final (g) *</label>
+            <label className="small muted">Bebida final (g)</label>
             <input className="pill" style={{display:'block', padding:'8px'}} type="number" min="0" step="0.1" value={output} onChange={e=>setOutput(e.target.value)} disabled={!useFlowEst}/>
           </div>
           <div>
-            <label className="small muted">Inicio extracción (s)</label>
-            <input className="pill" style={{display:'block', padding:'8px'}} type="number" min="0" step="0.1" value={tStart} onChange={e=>setTStart(e.target.value)} disabled={!useFlowEst}/>
+            <label className="small muted">Dosis (g)</label>
+            <input className="pill" style={{display:'block', padding:'8px'}} type="number" min="0" step="0.1" value={dose} onChange={e=>setDose(e.target.value)} />
           </div>
           <div>
-            <label className="small muted">Fin extracción (s)</label>
-            <input className="pill" style={{display:'block', padding:'8px'}} type="number" min="0" step="0.1" value={tEnd} onChange={e=>setTEnd(e.target.value)} disabled={!useFlowEst}/>
+            <label className="small muted">TDS (%)</label>
+            <input className="pill" style={{display:'block', padding:'8px'}} type="number" min="0" step="0.01" value={tds} onChange={e=>setTds(e.target.value)} />
+          </div>
+          <div>
+            <label className="small muted">EY (%)</label>
+            <div className="pill" style={{padding:'8px'}}>{EY!==null ? EY.toFixed(2) : '—'}</div>
           </div>
         </div>
-        <p className="small muted" style={{marginTop:6}}>
-          * Obligatorio si esta opción está activada. Si no defines inicio/fin, se usa toda la duración del video.
-        </p>
+
+        <h4 style={{marginTop:12}}>Calibración (detección)</h4>
+        <div className="row" style={{gap:16, flexWrap:'wrap'}}>
+          <div>
+            <label className="small muted">Δ Spikes (jets)</label>
+            <input type="range" min="1" max="5" step="1" value={spikeDelta} onChange={e=>setSpikeDelta(parseInt(e.target.value))}/>
+            <div className="small muted">Valor: {spikeDelta}</div>
+          </div>
+          <div>
+            <label className="small muted">Mín. jets para spike</label>
+            <input type="range" min="1" max="8" step="1" value={spikeMinJets} onChange={e=>setSpikeMinJets(parseInt(e.target.value))}/>
+            <div className="small muted">Valor: {spikeMinJets}</div>
+          </div>
+          <div>
+            <label className="small muted">Área mínima blob (px)</label>
+            <input type="range" min="10" max="200" step="5" value={minBlobArea} onChange={e=>setMinBlobArea(parseInt(e.target.value))}/>
+            <div className="small muted">Valor: {minBlobArea}</div>
+          </div>
+          <div>
+            <label className="small muted">Factor salto de área</label>
+            <input type="range" min="1.1" max="2.0" step="0.05" value={areaJumpFactor} onChange={e=>setAreaJumpFactor(parseFloat(e.target.value))}/>
+            <div className="small muted">Valor: {areaJumpFactor.toFixed(2)}×</div>
+          </div>
+        </div>
       </div>
 
       {/* 3) ROI (opcional) */}
@@ -509,7 +553,6 @@ function App() {
           <button className="btn" disabled={processing || !canAnalyze} onClick={runAnalysis}>Iniciar análisis</button>
           <button className="btn secondary" disabled={!metrics} onClick={exportShotCSV}>Exportar CSV (tiro)</button>
         </div>
-        {!canAnalyze && <p className="small warn" style={{marginTop:6}}>Completa los inputs requeridos para la estimación de flujo.</p>}
         {processing && <p className="small warn">Procesando en tu navegador… Mantén esta pestaña activa.</p>}
         {metrics && (
           <>
@@ -527,15 +570,15 @@ function App() {
             </div>
             <div style={{marginTop:12}}>
               <h4>Serie temporal: chorros (línea) + <span style={{color:'#f87171'}}>spikes</span> (marcas)</h4>
-              <canvas ref={chartRef} width={900} height={200} style={{width:'100%', border:'1px solid #232339', borderRadius:'8px', cursor:'pointer'}} title="Haz clic para saltar a ese tiempo" />
+              <canvas ref={chartRef} width={900} height={200} style={{width:'100%', border:'1px solid #232339', borderRadius:'8px', cursor:'pointer'}} title="Haz clic para saltar al frame" />
               <p className="small muted">Clic en el gráfico para saltar al frame y ver detalle de flujos estimados.</p>
             </div>
 
             {/* Detalle del frame clicado */}
             {inspect && (
               <div className="card" style={{marginTop:12}}>
-                <h4>Detalle en t = {inspect.t.toFixed(2)} s</h4>
-                <p className="small muted">Chorros detectados: {inspect.jets}. Flujo total estimado: {metrics.avgFlow_gps!=null? `${metrics.avgFlow_gps.toFixed(3)} g/s`:'—'}</p>
+                <h4>Detalle en t = {inspect.tRel.toFixed(2)} s</h4>
+                <p className="small muted">Chorros detectados: {inspect.jets??(inspect.flows?inspect.flows.length:'—')} · Flujo total estimado: {metrics.avgFlow_gps!=null? `${metrics.avgFlow_gps.toFixed(3)} g/s`:'—'}</p>
                 {inspect.flows ? (
                   <ol className="small">
                     {inspect.flows.slice(0,5).map((f,i)=>(
@@ -727,6 +770,72 @@ function giniCoefficient(values){
   }
   return cum / (n * sum)
 }
+function findNearestIndex(series, tRel){
+  if (!series?.length) return -1
+  let best = 0, bestD = Infinity
+  for (let i=0;i<series.length;i++){
+    const d = Math.abs(series[i].t - tRel)
+    if (d < bestD){ bestD = d; best = i }
+  }
+  return best
+}
+async function computeFlowDetailAt(video, roi, scale, avgFlow_gps){
+  const W = Math.round(video.videoWidth * scale)
+  const H = Math.round(video.videoHeight * scale)
+  const tmp = document.createElement('canvas'); tmp.width=W; tmp.height=H
+  const ctx = tmp.getContext('2d')
+  ctx.drawImage(video, 0, 0, W, H)
+  const cv = window.cv
+  const frame = cv.imread(tmp)
+  const r = roi ? roiRectScaled(roi, scale) : {x:0,y:0,w:W,h:H}
+  let A = frame.roi(new cv.Rect(r.x, r.y, r.w, r.h))
+  let g = new cv.Mat(); cv.cvtColor(A, g, cv.COLOR_RGBA2GRAY)
+  cv.GaussianBlur(g, g, new cv.Size(3,3), 0)
+  let m = new cv.Mat()
+  cv.adaptiveThreshold(g, m, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 21, 5)
+  let kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(3,3))
+  cv.morphologyEx(m, m, cv.MORPH_OPEN, kernel)
+
+  const areas = componentAreasCC(m, 35)
+  const jets = areas.length
+  let flows = null, gini = null, maxShare = null
+  if (avgFlow_gps!=null && areas.length>0){
+    const sumA = areas.reduce((a,b)=>a+b,0)
+    const shares = areas.map(a=>a/sumA)
+    flows = shares.map(s=>s*avgFlow_gps)
+    gini = giniCoefficient(flows)
+    maxShare = Math.max(...shares)
+  }
+
+  frame.delete(); A.delete(); g.delete(); m.delete(); kernel.delete()
+  return { t: video.currentTime, jets, flows, gini, maxShare }
+}
+async function renderOverlayAtCurrent(video, roi, scale){
+  const W = Math.round(video.videoWidth * scale)
+  const H = Math.round(video.videoHeight * scale)
+  const tmp = document.createElement('canvas'); tmp.width=W; tmp.height=H
+  const ctx = tmp.getContext('2d')
+  ctx.drawImage(video, 0, 0, W, H)
+  const cv = window.cv
+  const frame = cv.imread(tmp)
+  const r = roi ? roiRectScaled(roi, scale) : {x:0,y:0,w:W,h:H}
+  let A = frame.roi(new cv.Rect(r.x, r.y, r.w, r.h))
+  let g = new cv.Mat(); cv.cvtColor(A, g, cv.COLOR_RGBA2GRAY)
+  cv.GaussianBlur(g, g, new cv.Size(3,3), 0)
+  let m = new cv.Mat()
+  cv.adaptiveThreshold(g, m, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 21, 5)
+  let kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(3,3))
+  cv.morphologyEx(m, m, cv.MORPH_OPEN, kernel)
+
+  const out = canvasRef.current
+  out.width = W; out.height = H
+  const octx = out.getContext('2d')
+  octx.drawImage(tmp, 0, 0)
+  if (roi) drawRect(octx, r, '#60a5fa')
+  drawMaskContours(octx, m, r.x, r.y, '#60a5fa')
+
+  frame.delete(); A.delete(); g.delete(); m.delete(); kernel.delete()
+}
 
 // ---- Chart drawing & interaction ----
 function drawChart(canvas, series, spikesIdx, areaSeries){
@@ -801,63 +910,50 @@ function attachChartClick(canvas, series, onJump){
   canvas.onclick = handler
 }
 
-// ---- Recompute flow detail at time t ----
-async function computeFlowDetailAt(video, roi, scale, avgFlow_gps){
-  const W = Math.round(video.videoWidth * scale)
-  const H = Math.round(video.videoHeight * scale)
-  const tmp = document.createElement('canvas'); tmp.width=W; tmp.height=H
-  const ctx = tmp.getContext('2d')
-  ctx.drawImage(video, 0, 0, W, H)
-  const cv = window.cv
-  const frame = cv.imread(tmp)
-  const r = roi ? roiRectScaled(roi, scale) : {x:0,y:0,w:W,h:H}
-  let A = frame.roi(new cv.Rect(r.x, r.y, r.w, r.h))
-  let g = new cv.Mat(); cv.cvtColor(A, g, cv.COLOR_RGBA2GRAY)
-  cv.GaussianBlur(g, g, new cv.Size(3,3), 0)
-  let m = new cv.Mat()
-  cv.adaptiveThreshold(g, m, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 21, 5)
-  let kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(3,3))
-  cv.morphologyEx(m, m, cv.MORPH_OPEN, kernel)
+// ---------- styles ----------
+const th = { textAlign:'left', padding:'8px 6px', borderBottom:'1px solid #232339', color:'#9aa0b3' }
+const td = { padding:'8px 6px' }
 
-  const areas = componentAreasCC(m, 35)
-  const jets = areas.length
-  let flows = null, gini = null, maxShare = null
-  if (avgFlow_gps!=null && areas.length>0){
-    const sumA = areas.reduce((a,b)=>a+b,0)
-    const shares = areas.map(a=>a/sumA)
-    flows = shares.map(s=>s*avgFlow_gps)
-    gini = giniCoefficient(flows)
-    maxShare = Math.max(...shares)
-  }
-
-  frame.delete(); A.delete(); g.delete(); m.delete(); kernel.delete()
-  return { t: video.currentTime, jets, flows, gini, maxShare }
+// ---------- helpers ----------
+function normRect({x1,y1,x2,y2}){ const x=Math.min(x1,x2), y=Math.min(y1,y2); return {x,y,w:Math.abs(x2-x1),h:Math.abs(y2-y1)} }
+function roiRectScaled(roi,s){ return {x:Math.round(roi.x*s), y:Math.round(roi.y*s), w:Math.round(roi.w*s), h:Math.round(roi.h*s)} }
+function drawRect(ctx,r,color='#60a5fa'){ ctx.save(); ctx.strokeStyle=color; ctx.lineWidth=2; ctx.strokeRect(r.x,r.y,r.w,r.h); ctx.restore() }
+function parseFloatOrNull(v){ const n = parseFloat(v); return Number.isFinite(n) ? n : null }
+function round2(x){ return Math.round((x + Number.EPSILON)*100)/100 }
+function round3(x){ return Math.round((x + Number.EPSILON)*1000)/1000 }
+function fmtDate(iso){ try{ return new Date(iso).toLocaleString() } catch{ return iso } }
+function val(v){ return (v===null || v===undefined || v==='') ? '—' : v }
+function csvSafe(s){ if (!s) return ''; const q = String(s).replace(/"/g,'""'); return `"${q}"` }
+function computeEY(dose, output, tds){
+  const d = parseFloat(dose), o = parseFloat(output), t = parseFloat(tds)
+  if (!Number.isFinite(d) || d<=0 || !Number.isFinite(o) || o<0 || !Number.isFinite(t) || t<0) return null
+  // EY% = (TDS% * beverage_mass) / dose
+  return (t * o) / d
 }
-
-// ---- Recommendations based on metrics ----
-function generateRecommendations(m){
-  const recs = []
-  const dur = m.duration || 30
-  const thirds = dur/3
-  // Early, mid, late spikes
-  const earlySpikes = m.series.filter(p=>p.spike && p.t<thirds).length
-  const midSpikes = m.series.filter(p=>p.spike && p.t>=thirds && p.t<2*thirds).length
-  const lateSpikes = m.series.filter(p=>p.spike && p.t>=2*thirds).length
-
-  if (earlySpikes>0) recs.push("Picos tempranos: mejora distribución (WDT profundo), nivela y prueba preinfusión más suave/larga.")
-  if (midSpikes>0) recs.push("Picos a mitad del tiro: revisa consistencia del flujo/presión; considera reducir caudal o suavizar la rampa.")
-  if (lateSpikes>0) recs.push("Picos al final: probablemente rendimientos decrecientes; evalúa cortar antes o bajar ratio.")
-
-  if (m.jets_cv > 0.5 && m.spikeRate < 0.05) recs.push("Alta variabilidad sin muchos picos: añade puck screen o filtro de papel para estabilizar el frente de extracción.")
-  if (m.areaJumpRate > 0.10) recs.push("Saltos grandes de área: sprays/fines → afina molienda un poco o mejora WDT para reducir conglomerados.")
-  if (m.avgFlow_gps!=null){
-    if (m.giniMed!=null && m.giniMed>0.3) recs.push("Distribución de flujo desigual (Gini>0.3): revisa WDT y nivelado; considera preinfusión más larga.")
-    if (m.maxShareMed!=null && m.maxShareMed>0.45) recs.push("Un chorro concentra gran parte del flujo: posible canal dominante; prueba reducir presión o flow-control al inicio.")
-  }
-  if (m.score >= 70) recs.push("Score elevado: prueba secuencia de control (WDT → PI suave → presión estable) y vuelve a medir.")
-
-  if (recs.length===0) recs.push("Flujo estable: conserva receta y técnica; afina por sabor (temperatura/ratio) para mejorar dulzor y balance.")
-  return recs
+function median(arr){
+  if (!arr || !arr.length) return null
+  const a = [...arr].sort((x,y)=>x-y)
+  const n = a.length
+  return n%2? a[(n-1)/2] : (a[n/2-1]+a[n/2])/2
 }
-
-export default App
+function meanArr(a){ return a.length? a.reduce((x,y)=>x+y,0)/a.length : 0 }
+function varArr(a,m){ return a.length? a.reduce((x,y)=>x+(y-m)*(y-m),0)/a.length : 0 }
+function stdArr(a,m){ const v = varArr(a,m); return Math.sqrt(v) }
+function clamp(x, lo, hi){ return Math.max(lo, Math.min(hi, x)) }
+function mapRange(x, inMin, inMax, outMin, outMax){
+  if (inMax===inMin) return outMin
+  const t = (x-inMin)/(inMax-inMin)
+  return outMin + clamp(t,0,1)*(outMax-outMin)
+}
+function giniCoefficient(values){
+  if (!values || !values.length) return 0
+  const x = values.slice().sort((a,b)=>a-b)
+  const n = x.length
+  const sum = x.reduce((a,b)=>a+b,0)
+  if (sum === 0) return 0
+  let cum = 0
+  for (let i=0;i<n;i++){
+    cum += (2*(i+1)-n-1) * x[i]
+  }
+  return cum / (n * sum)
+}
