@@ -153,13 +153,22 @@ function App() {
   };
 
   /* ---- ROI drawing (mouse + touch) ---- */
-  const getPoint = (evt, target) => {
-    const rect = target.getBoundingClientRect();
-    const touch = evt.touches?.[0] || evt.changedTouches?.[0];
-    const cx = touch ? touch.clientX : evt.clientX;
-    const cy = touch ? touch.clientY : evt.clientY;
-    return { x: cx - rect.left, y: cy - rect.top };
+ // Reemplazo completo de getPoint
+const getPoint = (evt, target) => {
+  const rect = target.getBoundingClientRect();
+  const touch = evt.touches?.[0] || evt.changedTouches?.[0];
+  const clientX = touch ? touch.clientX : evt.clientX;
+  const clientY = touch ? touch.clientY : evt.clientY;
+
+  // Escala de CSS px -> px internos del canvas
+  const sx = target.width  / rect.width;
+  const sy = target.height / rect.height;
+
+  return {
+    x: (clientX - rect.left) * sx,
+    y: (clientY - rect.top)  * sy,
   };
+};
 
   const onCanvasPointerDown = (x, y) => {
     if (!frameLoaded) { grabFrame(); return; }
